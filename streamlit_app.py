@@ -39,6 +39,9 @@ class StateManager:
         
         if 'meal_history' not in st.session_state:
             st.session_state.meal_history = []
+            
+        if 'selected_recipe_index' not in st.session_state:
+            st.session_state.selected_recipe_index = None
 
 class GPTClient:
     def __init__(self, api_key: str):
@@ -69,6 +72,13 @@ class GPTClient:
     
     def parse_inventory_from_image(self, image_data: str) -> List[Dict]:
         prompt = """이 영수증 이미지에서 식재료와 수량 정보를 추출해주세요.
+
+**중요한 이름 규칙**: 
+상품명(name)에서 '맛있는', '신선한', '몸에 좋은', '유기농', '국산', '프리미엄' 같은 **수식어, 형용사, 브랜드명은 모두 제거**하고 **핵심 식재료 명칭**만 적어주세요.
+- 예시: '맛있는 부산 어묵' -> '어묵'
+- 예시: '신선한 무항생제 달걀' -> '달걀'
+- 예시: '유기농 흙당근' -> '당근'
+- 예시: '몸에 좋은 제철 시금치' -> '시금치'
 
 다음 JSON 형식으로만 응답해주세요 (다른 설명 없이):
 [
@@ -178,8 +188,8 @@ class GPTClient:
 
 **계산 규칙**:
 1. 단위가 서로 다를 경우(개 vs g), **평균 무게**를 기준으로 환산하여 차감하세요.
-   - 예: '양파 150g' 사용, 재고가 '양파 3개'라면 -> 양파 1개(약 200g)를 사용한 것으로 간주하여 '양파 2개' 남음으로 처리.
-   - 예: '달걀 100g' 사용, 재고가 '달걀 10개'라면 -> 달걀 2개(50g*2) 차감.
+    - 예: '양파 150g' 사용, 재고가 '양파 3개'라면 -> 양파 1개(약 200g)를 사용한 것으로 간주하여 '양파 2개' 남음으로 처리.
+    - 예: '달걀 100g' 사용, 재고가 '달걀 10개'라면 -> 달걀 2개(50g*2) 차감.
 
 2. '개' 단위의 재료는 소수점으로 남기지 말고, 가급적 정수 단위 혹은 0.5단위로 처리하세요. (예: 2.2개 -> 2개)
 3. 액체류는 ml 단위로 정확히 계산하세요.
@@ -215,18 +225,21 @@ class GPTClient:
         
         return updated_items
 
-    def recommend_nutrient_rich_recipes(self, deficiency: Dict) -> List[Dict]:
+    # [수정됨] inventory 인자를 추가하고, 부족한 재료(missing_ingredients)를 같이 요청
+    def recommend_nutrient_rich_recipes(self, deficiency: Dict, inventory: List[Dict]) -> List[Dict]:
         deficiency_str = ", ".join([f"{k} {v:.1f} 부족" for k, v in deficiency.items()])
+        inventory_str = json.dumps(inventory, ensure_ascii=False)
         
-        # 프롬프트 수정: 재료 수량, 조리 과정, 유튜브 검색어 요청 추가
         prompt = f"""다음 부족한 영양소를 효과적으로 보충할 수 있는 요리 메뉴 2가지를 추천해주세요.
 
 부족한 상태: {deficiency_str}
+현재 보유 재고: {inventory_str}
 
 조건:
 1. 부족한 영양소가 풍부한 식재료를 주재료로 사용해야 합니다.
 2. 각 메뉴가 왜 이 영양소 보충에 좋은지 'reason'에 한 문장으로 설명해주세요.
 3. 재료는 반드시 구체적인 수량(g, ml, 개)을 포함해주세요.
+4. **현재 보유 재고와 비교하여 부족한 재료가 있다면 'missing_ingredients' 리스트에 담아주세요.** (재고가 충분하면 빈 리스트)
 
 다음 JSON 형식으로만 응답해주세요 (다른 설명 없이):
 [
@@ -234,6 +247,7 @@ class GPTClient:
         "name": "메뉴명",
         "reason": "이 메뉴가 추천된 이유",
         "ingredients": ["재료명 수량g", "재료명 수량ml", ...],
+        "missing_ingredients": ["부족한재료1", "부족한재료2", ...],
         "steps": ["조리과정1", "조리과정2", ...],
         "nutrition": {{"calories": 숫자, "protein": 숫자, "carbs": 숫자, "fat": 숫자}},
         "youtube_query": "유튜브 검색어"
@@ -251,8 +265,10 @@ class GPTClient:
         content = content.replace("```json", "").replace("```", "").strip()
         return json.loads(content)
 
-# 공통 레시피 UI 렌더링 함수 (중복 로직 제거)
-def render_recipe_ui(gpt_client, recipe, key_suffix):
+# -------------------------------------------------------------------------
+# UI 렌더링 함수 수정: missing_ingredients 표시 로직 추가
+# -------------------------------------------------------------------------
+def render_recipe_ui(gpt_client, recipe, index, key_suffix, origin_list_key=None, show_use_btn=True, show_delete_btn=False):
     with st.expander(f"🍽️ {recipe['name']}", expanded=True):
         col1, col2 = st.columns([2, 1])
         
@@ -264,6 +280,10 @@ def render_recipe_ui(gpt_client, recipe, key_suffix):
             for ingredient in recipe['ingredients']:
                 st.write(f"- {ingredient}")
             
+            # [추가됨] 부족한 재료가 있으면 표시 (보양 메뉴 추천에서 사용됨)
+            if 'missing_ingredients' in recipe and recipe['missing_ingredients']:
+                st.warning(f"⚠️ 부족한 재료: {', '.join(recipe['missing_ingredients'])}")
+            
             if 'steps' in recipe:
                 st.subheader("조리 방법")
                 for idx, step in enumerate(recipe['steps'], 1):
@@ -272,7 +292,6 @@ def render_recipe_ui(gpt_client, recipe, key_suffix):
         with col2:
             st.subheader("영양 정보")
             nutrition = recipe['nutrition']
-            # 영양소 한글 매핑 적용
             nutri_map = {"calories": "칼로리", "protein": "단백질", "carbs": "탄수화물", "fat": "지방"}
             unit_map = {"calories": "kcal", "protein": "g", "carbs": "g", "fat": "g"}
             
@@ -281,91 +300,105 @@ def render_recipe_ui(gpt_client, recipe, key_suffix):
                 unit = unit_map.get(k, "")
                 st.metric(kor_key, f"{v} {unit}")
         
+        # 버튼 영역
         col_btn1, col_btn2 = st.columns(2)
+        
         with col_btn1:
             if 'youtube_query' in recipe:
                 youtube_url = f"https://www.youtube.com/results?search_query={recipe['youtube_query']}"
                 st.link_button("유튜브에서 보기", youtube_url)
         
         with col_btn2:
-            if st.button("이 레시피 사용", key=f"use_{recipe['name']}_{key_suffix}"):
-                with st.spinner("재고를 확인중입니다..."):
-                    try:
-                        check_prompt = f"""현재 재고로 이 레시피를 만들 수 있는지 엄격하게 확인하지 말고, 통상적인 식재료 무게를 고려하여 유연하게 판단해주세요.
+            if show_use_btn:
+                if st.button("이 레시피 사용", key=f"use_{index}_{key_suffix}"):
+                    with st.spinner("재고를 확인중입니다..."):
+                        try:
+                            check_prompt = f"""현재 재고로 이 레시피를 만들 수 있는지 엄격하게 확인하지 말고, 통상적인 식재료 무게를 고려하여 유연하게 판단해주세요.
 
 현재 재고: {json.dumps(st.session_state.inventory, ensure_ascii=False)}
 레시피 재료: {json.dumps(recipe['ingredients'], ensure_ascii=False)}
 
 **핵심 판단 기준 (단위 변환)**:
 1. 재고는 '개' 단위이고 레시피는 'g/ml' 단위일 경우, 아래 평균 무게를 기준으로 변환하여 판단하세요.
-   - 양파 1개 ≈ 200g, 감자 1개 ≈ 150g, 당근 1개 ≈ 150g, 달걀 1개 ≈ 50g, 대파 1대 ≈ 80g, 마늘 1쪽 ≈ 5g
+    - 양파 1개 ≈ 200g, 감자 1개 ≈ 150g, 당근 1개 ≈ 150g, 달걀 1개 ≈ 50g, 대파 1대 ≈ 80g, 마늘 1쪽 ≈ 5g
 
 2. 예시: 
-   - 재고 '양파 1개' vs 레시피 '양파 150g' -> **충분함 (true)**
-   - 재고 '양파 1개' vs 레시피 '양파 300g' -> 부족함 (false)
+    - 재고 '양파 1개' vs 레시피 '양파 150g' -> **충분함 (true)**
+    - 재고 '양파 1개' vs 레시피 '양파 300g' -> 부족함 (false)
 
 다음 JSON 형식으로만 응답해주세요:
 {{
     "sufficient": true or false,
     "missing_items": ["부족한 재료1 (필요: X, 보유: Y)", ...]
 }}"""
-                        
-                        check_response = gpt_client.client.chat.completions.create(
-                            model="gpt-4o",
-                            messages=[{"role": "user", "content": check_prompt}],
-                            temperature=0.3
-                        )
-                        
-                        check_content = check_response.choices[0].message.content.strip()
-                        check_content = check_content.replace("```json", "").replace("```", "").strip()
-                        check_result = json.loads(check_content)
-                        
-                        if not check_result['sufficient']:
-                            st.error(f"❌ 재고가 부족합니다! 부족한 재료: {', '.join(check_result['missing_items'])}")
-                        else:
-                            with st.spinner("재고를 업데이트중입니다..."):
-                                updated_inventory = gpt_client.update_inventory_after_cooking(
-                                    st.session_state.inventory,
-                                    recipe['ingredients']
-                                )
-                                st.session_state.inventory = updated_inventory
-                                
-                                st.session_state.meal_history.append({
-                                    'date': datetime.now().isoformat(),
-                                    'recipe_name': recipe['name'],
-                                    'nutrition': recipe['nutrition']
-                                })
-                                
-                                daily_intake = {}
-                                for meal in st.session_state.meal_history:
-                                    date_key = meal['date'][:10]
-                                    if date_key not in daily_intake:
-                                        daily_intake[date_key] = {'calories': 0, 'protein': 0, 'carbs': 0, 'fat': 0}
+                            
+                            check_response = gpt_client.client.chat.completions.create(
+                                model="gpt-4o",
+                                messages=[{"role": "user", "content": check_prompt}],
+                                temperature=0.3
+                            )
+                            
+                            check_content = check_response.choices[0].message.content.strip()
+                            check_content = check_content.replace("```json", "").replace("```", "").strip()
+                            check_result = json.loads(check_content)
+                            
+                            if not check_result['sufficient']:
+                                st.error(f"❌ 재고가 부족합니다! 부족한 재료: {', '.join(check_result['missing_items'])}")
+                            else:
+                                with st.spinner("재고를 업데이트중입니다..."):
+                                    updated_inventory = gpt_client.update_inventory_after_cooking(
+                                        st.session_state.inventory,
+                                        recipe['ingredients']
+                                    )
+                                    st.session_state.inventory = updated_inventory
                                     
-                                    daily_intake[date_key]['calories'] += meal['nutrition']['calories']
-                                    daily_intake[date_key]['protein'] += meal['nutrition']['protein']
-                                    daily_intake[date_key]['carbs'] += meal['nutrition']['carbs']
-                                    daily_intake[date_key]['fat'] += meal['nutrition']['fat']
-                                
-                                days_count = len(daily_intake)
-                                if days_count > 0:
-                                    avg_nutrition = {
-                                        'calories': sum(d['calories'] for d in daily_intake.values()) / days_count,
-                                        'protein': sum(d['protein'] for d in daily_intake.values()) / days_count,
-                                        'carbs': sum(d['carbs'] for d in daily_intake.values()) / days_count,
-                                        'fat': sum(d['fat'] for d in daily_intake.values()) / days_count
-                                    }
-                                    st.session_state.nutrition_status['daily_average'] = avg_nutrition
+                                    st.session_state.meal_history.append({
+                                        'date': datetime.now().isoformat(),
+                                        'recipe_name': recipe['name'],
+                                        'nutrition': recipe['nutrition']
+                                    })
                                     
-                                    target = st.session_state.nutrition_status['daily_target']
-                                    st.session_state.nutrition_status['deficiency'] = {
-                                        k: max(0, target[k] - avg_nutrition[k]) for k in target.keys()
-                                    }
-                                
-                                st.success("✅ 재고가 업데이트되었습니다!")
-                                st.rerun()
-                    except Exception as e:
-                        st.error(f"오류 발생: {str(e)}")
+                                    daily_intake = {}
+                                    for meal in st.session_state.meal_history:
+                                        date_key = meal['date'][:10]
+                                        if date_key not in daily_intake:
+                                            daily_intake[date_key] = {'calories': 0, 'protein': 0, 'carbs': 0, 'fat': 0}
+                                        
+                                        daily_intake[date_key]['calories'] += meal['nutrition']['calories']
+                                        daily_intake[date_key]['protein'] += meal['nutrition']['protein']
+                                        daily_intake[date_key]['carbs'] += meal['nutrition']['carbs']
+                                        daily_intake[date_key]['fat'] += meal['nutrition']['fat']
+                                    
+                                    days_count = len(daily_intake)
+                                    if days_count > 0:
+                                        avg_nutrition = {
+                                            'calories': sum(d['calories'] for d in daily_intake.values()) / days_count,
+                                            'protein': sum(d['protein'] for d in daily_intake.values()) / days_count,
+                                            'carbs': sum(d['carbs'] for d in daily_intake.values()) / days_count,
+                                            'fat': sum(d['fat'] for d in daily_intake.values()) / days_count
+                                        }
+                                        st.session_state.nutrition_status['daily_average'] = avg_nutrition
+                                        
+                                        target = st.session_state.nutrition_status['daily_target']
+                                        st.session_state.nutrition_status['deficiency'] = {
+                                            k: max(0, target[k] - avg_nutrition[k]) for k in target.keys()
+                                        }
+                                    
+                                    st.success("✅ 재고가 업데이트되었습니다!")
+                                    
+                                    if origin_list_key == 'recommended_recipes':
+                                        st.session_state.selected_recipe_index = index
+                                        
+                                    st.rerun()
+                        except Exception as e:
+                            st.error(f"오류 발생: {str(e)}")
+            
+            if show_delete_btn:
+                if st.button("삭제", key=f"del_rec_{index}_{key_suffix}"):
+                    if origin_list_key and origin_list_key in st.session_state:
+                        st.session_state[origin_list_key] = []
+                        st.session_state.selected_recipe_index = None
+                        st.rerun()
 
 def render_inventory_page(gpt_client: GPTClient):
     st.header("🥗 냉장고 재고 관리")
@@ -527,7 +560,8 @@ def render_nutrition_page(gpt_client: GPTClient):
         if st.button("✨ 부족한 영양소를 채워줄 메뉴 추천받기", type="primary", use_container_width=True):
             with st.spinner("영양 밸런스를 위한 최적의 메뉴를 찾고 있습니다..."):
                 try:
-                    recipes = gpt_client.recommend_nutrient_rich_recipes(deficient_items)
+                    # [수정됨] inventory 인자 추가
+                    recipes = gpt_client.recommend_nutrient_rich_recipes(deficient_items, st.session_state.inventory)
                     st.session_state.nutrient_recipes = recipes
                 except Exception as e:
                     st.error(f"추천 중 오류 발생: {str(e)}")
@@ -536,9 +570,8 @@ def render_nutrition_page(gpt_client: GPTClient):
             st.write("---")
             st.write("### 🥗 추천 보양 메뉴")
             
-            for recipe in st.session_state.nutrient_recipes:
-                # 공통 UI 함수 호출
-                render_recipe_ui(gpt_client, recipe, "nutrient")
+            for idx, recipe in enumerate(st.session_state.nutrient_recipes):
+                render_recipe_ui(gpt_client, recipe, idx, "nutrient", origin_list_key='nutrient_recipes', show_use_btn=True, show_delete_btn=False)
 
 def render_recommendation_page(gpt_client: GPTClient):
     st.header("🍳 메뉴 추천")
@@ -556,13 +589,39 @@ def render_recommendation_page(gpt_client: GPTClient):
                     st.session_state.meal_history
                 )
                 st.session_state.recommended_recipes = recipes
+                st.session_state.selected_recipe_index = None
             except Exception as e:
                 st.error(f"오류 발생: {str(e)}")
     
     if 'recommended_recipes' in st.session_state and st.session_state.recommended_recipes:
-        for recipe in st.session_state.recommended_recipes:
-            # 공통 UI 함수 호출
-            render_recipe_ui(gpt_client, recipe, "recommend")
+        selected_idx = st.session_state.selected_recipe_index
+        
+        if selected_idx is None:
+            for idx, recipe in enumerate(st.session_state.recommended_recipes):
+                render_recipe_ui(
+                    gpt_client, 
+                    recipe, 
+                    idx, 
+                    "recommend", 
+                    origin_list_key='recommended_recipes',
+                    show_use_btn=True,
+                    show_delete_btn=False
+                )
+        else:
+            if 0 <= selected_idx < len(st.session_state.recommended_recipes):
+                target_recipe = st.session_state.recommended_recipes[selected_idx]
+                render_recipe_ui(
+                    gpt_client, 
+                    target_recipe, 
+                    selected_idx, 
+                    "recommend", 
+                    origin_list_key='recommended_recipes',
+                    show_use_btn=False, 
+                    show_delete_btn=True 
+                )
+            else:
+                st.session_state.selected_recipe_index = None
+                st.rerun()
 
 def main():
     st.set_page_config(
@@ -573,53 +632,20 @@ def main():
     
     StateManager.initialize()
     
-    if 'api_key' not in st.session_state:
-        st.session_state.api_key = None
-    
     with st.sidebar:
         st.title("tAIste")
         st.caption("똑똑한 냉장고 관리 & 맞춤 메뉴 추천")
-        
-        api_key = st.text_input(
-            "OpenAI API Key",
-            type="password",
-            value=st.session_state.api_key or "",
-            help="sk-proj- 또는 sk-로 시작하는 API 키를 입력하세요"
-        )
-        
-        if api_key and api_key != st.session_state.api_key:
-            if api_key.startswith("sk-"):
-                try:
-                    test_client = OpenAI(api_key=api_key)
-                    test_client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": "Hi"}],
-                        max_tokens=5
-                    )
-                    st.session_state.api_key = api_key
-                    st.success("✅ API 키가 확인되었습니다!")
-                except Exception as e:
-                    st.error(f"❌ API 키가 올바르지 않습니다: {str(e)}")
-                    st.session_state.api_key = None
-            else:
-                st.error("❌ API 키는 'sk-'로 시작해야 합니다")
-                st.session_state.api_key = None
-        
         st.divider()
         
         page = st.radio(
             "메뉴",
-            ["재고 관리", "영양 분석", "메뉴 추천"],
+            ["재고 관리", "메뉴 추천", "영양 분석"], 
             index=0
         )
     
-    if not st.session_state.api_key:
-        st.warning("👈 사이드바에서 OpenAI API 키를 입력해주세요.")
-        st.info("API 키는 https://platform.openai.com/api-keys 에서 발급받을 수 있습니다.")
-        return
-    
     try:
-        gpt_client = GPTClient(st.session_state.api_key)
+        api_key = st.secrets["OPENAI_API_KEY"]
+        gpt_client = GPTClient(api_key)
         
         if page == "재고 관리":
             render_inventory_page(gpt_client)
@@ -627,6 +653,9 @@ def main():
             render_nutrition_page(gpt_client)
         elif page == "메뉴 추천":
             render_recommendation_page(gpt_client)
+            
+    except KeyError:
+        st.warning("👈 사이드바 API 키를 입력하는 대신, `.streamlit/secrets.toml` 파일에 'OPENAI_API_KEY'를 설정해주세요.")
     except Exception as e:
         st.error(f"API 연결 오류: {str(e)}")
 
