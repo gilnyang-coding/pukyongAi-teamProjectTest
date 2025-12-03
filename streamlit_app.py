@@ -225,7 +225,6 @@ class GPTClient:
         
         return updated_items
 
-    # [수정됨] inventory 인자를 추가하고, 부족한 재료(missing_ingredients)를 같이 요청
     def recommend_nutrient_rich_recipes(self, deficiency: Dict, inventory: List[Dict]) -> List[Dict]:
         deficiency_str = ", ".join([f"{k} {v:.1f} 부족" for k, v in deficiency.items()])
         inventory_str = json.dumps(inventory, ensure_ascii=False)
@@ -266,7 +265,7 @@ class GPTClient:
         return json.loads(content)
 
 # -------------------------------------------------------------------------
-# UI 렌더링 함수 수정: missing_ingredients 표시 로직 추가
+# UI 렌더링 함수
 # -------------------------------------------------------------------------
 def render_recipe_ui(gpt_client, recipe, index, key_suffix, origin_list_key=None, show_use_btn=True, show_delete_btn=False):
     with st.expander(f"🍽️ {recipe['name']}", expanded=True):
@@ -280,7 +279,6 @@ def render_recipe_ui(gpt_client, recipe, index, key_suffix, origin_list_key=None
             for ingredient in recipe['ingredients']:
                 st.write(f"- {ingredient}")
             
-            # [추가됨] 부족한 재료가 있으면 표시 (보양 메뉴 추천에서 사용됨)
             if 'missing_ingredients' in recipe and recipe['missing_ingredients']:
                 st.warning(f"⚠️ 부족한 재료: {', '.join(recipe['missing_ingredients'])}")
             
@@ -560,7 +558,6 @@ def render_nutrition_page(gpt_client: GPTClient):
         if st.button("✨ 부족한 영양소를 채워줄 메뉴 추천받기", type="primary", use_container_width=True):
             with st.spinner("영양 밸런스를 위한 최적의 메뉴를 찾고 있습니다..."):
                 try:
-                    # [수정됨] inventory 인자 추가
                     recipes = gpt_client.recommend_nutrient_rich_recipes(deficient_items, st.session_state.inventory)
                     st.session_state.nutrient_recipes = recipes
                 except Exception as e:
@@ -572,6 +569,30 @@ def render_nutrition_page(gpt_client: GPTClient):
             
             for idx, recipe in enumerate(st.session_state.nutrient_recipes):
                 render_recipe_ui(gpt_client, recipe, idx, "nutrient", origin_list_key='nutrient_recipes', show_use_btn=True, show_delete_btn=False)
+
+    st.divider()
+    st.subheader("📅 최근 식사 기록")
+    
+    if st.session_state.meal_history:
+        for meal in reversed(st.session_state.meal_history):
+            try:
+                dt = datetime.fromisoformat(meal['date'])
+                date_str = dt.strftime("%Y-%m-%d %H:%M")
+            except:
+                date_str = meal['date']
+            
+            with st.container():
+                c1, c2 = st.columns([3, 1])
+                with c1:
+                    st.write(f"**{meal['recipe_name']}**")
+                    st.caption(f"{date_str}")
+                with c2:
+                    n = meal['nutrition']
+                    st.write(f"{n['calories']} kcal")
+                    st.caption(f"C:{n['carbs']} P:{n['protein']} F:{n['fat']}")
+            st.divider()
+    else:
+        st.info("아직 식사 기록이 없습니다. 메뉴 추천에서 요리를 완료해보세요!")
 
 def render_recommendation_page(gpt_client: GPTClient):
     st.header("🍳 메뉴 추천")
@@ -632,9 +653,40 @@ def main():
     
     StateManager.initialize()
     
+    if 'api_key' not in st.session_state:
+        st.session_state.api_key = None
+
     with st.sidebar:
         st.title("tAIste")
         st.caption("똑똑한 냉장고 관리 & 맞춤 메뉴 추천")
+        
+        # [수정됨] 사이드바에서 API 키 입력 (기본값 제거)
+        api_key = st.text_input(
+            "OpenAI API Key",
+            type="password",
+            value=st.session_state.api_key or "",
+            help="sk-proj- 또는 sk-로 시작하는 API 키를 입력하세요"
+        )
+        
+        if api_key and api_key != st.session_state.api_key:
+            if api_key.startswith("sk-"):
+                try:
+                    test_client = OpenAI(api_key=api_key)
+                    # 간단한 테스트 호출로 유효성 검사
+                    test_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": "Hi"}],
+                        max_tokens=5
+                    )
+                    st.session_state.api_key = api_key
+                    st.success("✅ API 키가 확인되었습니다!")
+                except Exception as e:
+                    st.error(f"❌ API 키가 올바르지 않습니다: {str(e)}")
+                    st.session_state.api_key = None
+            else:
+                st.error("❌ API 키는 'sk-'로 시작해야 합니다")
+                st.session_state.api_key = None
+        
         st.divider()
         
         page = st.radio(
@@ -643,9 +695,12 @@ def main():
             index=0
         )
     
+    if not st.session_state.api_key:
+        st.warning("👈 사이드바에서 OpenAI API 키를 입력해주세요.")
+        return
+
     try:
-        api_key = st.secrets["OPENAI_API_KEY"]
-        gpt_client = GPTClient(api_key)
+        gpt_client = GPTClient(st.session_state.api_key)
         
         if page == "재고 관리":
             render_inventory_page(gpt_client)
@@ -654,8 +709,6 @@ def main():
         elif page == "메뉴 추천":
             render_recommendation_page(gpt_client)
             
-    except KeyError:
-        st.warning("👈 사이드바 API 키를 입력하는 대신, `.streamlit/secrets.toml` 파일에 'OPENAI_API_KEY'를 설정해주세요.")
     except Exception as e:
         st.error(f"API 연결 오류: {str(e)}")
 
